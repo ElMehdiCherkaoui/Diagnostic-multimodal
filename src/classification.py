@@ -1,126 +1,246 @@
-import os, time, random
-import numpy as np
-import pandas as pd
+import os
+import random
+
 import cv2
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.model_selection import train_test_split
+import numpy as np
 import tensorflow as tf
-from sklearn.metrics import classification_report, confusion_matrix
 from PIL import Image
-
-# ======================================================================
-# CLASSIFICATION DES TUMEURS CEREBRALES AVEC GOOGLENET
-# ======================================================================
-# TIP: Test your code in notebook.ipynb first, then move the working code here as functions. ATTENTION: Keras n'a pas InceptionV1 dans keras.applications (seulement InceptionV3). Cherche des poids GoogLeNet préentraînés (port Keras, ou conversion depuis torchvision).
-#
-# WHAT TO DO IN THIS FILE:
-#
-# 1. Charger les images, vérifier extensions et intégrité (try-except), écarter les fichiers invalides.
-# 2. Explorer les classes (noms de dossiers), countplot, afficher un échantillon par classe.
-# 3. Répartir les images en trois ensembles : Train (70 %), Validation (15 %) et Test (15 %), puis compter et afficher le nombre d'images dans chaque ensemble.
-# 4. Appliquer des techniques d'augmentation des données (blur, noise, flip) uniquement sur les données d'entraînement, afin d'enrichir les échantillons et de réduire les déséquilibres entre les classes.
-# 5. Charger avec image_dataset_from_directory() (redimensionnement, batch, shuffle=True pour le train), puis normaliser selon le modèle.
-# 6. Charger le modèle préentraîné GoogLeNet (InceptionV1), geler ses couches de base, remplacer sa tête de classification par une nouvelle adaptée au nombre de classes, puis entraîner uniquement cette dernière (Feature Extraction).
-# 7. Déterminer les hyperparamètres d'entraînement : learning rate, fonction de perte (loss) et optimiseur (optimizer).
-# 8. Entraîner le modèle sur l'ensemble d'entraînement et suivre ses performances sur l'ensemble de validation.
-# 9. Évaluer le modèle : accuracy, précision (precision), rappel (recall) et F1-score.
-# 10. Analyser les résultats avec une matrice de confusion et comparer les performances sur les ensembles d'entraînement et de test.
-# 11. Dégeler les dernières couches du modèle préentraîné, poursuivre le fine-tuning avec un faible learning rate, réévaluer le modèle et comparer avec le modèle du Feature Extraction.
-# 12. Sauvegarder le modèle entraîné.
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split
 
 
-# --- Write your code below ---
+DATA_DIR = "./data/classification"
+TRAIN_DIR = os.path.join(DATA_DIR, "Train")
+VAL_DIR = os.path.join(DATA_DIR, "Val")
+MODEL_PATH = "./models/brain_tumor_classification.keras"
+IMAGE_SIZE = (224, 224)
+CLASS_NAMES = ["Glioma", "Meningioma", "No Tumor", "Pituitary"]
+VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
 
-def validate_image_dataset(split_dir, class_names, valid_extensions):
+
+def setup_gpu():
+    gpus = tf.config.list_physical_devices("GPU")
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    return gpus
+
+
+def validate_image_dataset(split_dir):
     valid_images = []
     invalid_images = []
 
-    for class_name in class_names:
-        folder_path = os.path.join(split_dir, class_name, "images")
+    for class_name in CLASS_NAMES:
+        image_dir = os.path.join(split_dir, class_name, "images")
+        if not os.path.isdir(image_dir):
+            continue
 
-        for file_name in os.listdir(folder_path):
-
-            file_path = os.path.join(folder_path, file_name)
-
-            if not os.path.isfile(file_path):
-                continue
-
+        for file_name in os.listdir(image_dir):
+            file_path = os.path.join(image_dir, file_name)
             extension = os.path.splitext(file_name)[1].lower()
 
-            if extension not in valid_extensions:
+            if not os.path.isfile(file_path) or extension not in VALID_EXTENSIONS:
                 invalid_images.append(file_path)
                 continue
 
             try:
-                with Image.open(file_path) as img:
-                    img.load()
-
+                with Image.open(file_path) as image:
+                    image.verify()
                 valid_images.append(file_path)
-
             except Exception:
                 invalid_images.append(file_path)
 
     return valid_images, invalid_images
 
-def get_label_from_path(image_path,class_names):
-    for class_name in class_names:
-        if class_name in image_path:
+
+def get_label_from_path(image_path):
+    for class_name in CLASS_NAMES:
+        if os.sep + class_name + os.sep in image_path:
             return class_name
     return None
 
-def split_dataset(X,class_names):
-    X_train, X_temp = train_test_split(
-        X, test_size=0.3, random_state=42
+
+def explore_dataset(split_dir=TRAIN_DIR):
+    valid_images, invalid_images = validate_image_dataset(split_dir)
+    counts = {class_name: 0 for class_name in CLASS_NAMES}
+
+    for image_path in valid_images:
+        class_name = get_label_from_path(image_path)
+        if class_name is not None:
+            counts[class_name] += 1
+
+    return {
+        "valid_images": len(valid_images),
+        "invalid_images": len(invalid_images),
+        "class_counts": counts,
+    }
+
+
+def split_dataset(image_paths, test_size=0.3, validation_size=0.5):
+    labels = [get_label_from_path(path) for path in image_paths]
+    train_paths, temporary_paths, train_labels, temporary_labels = train_test_split(
+        image_paths,
+        labels,
+        test_size=test_size,
+        random_state=42,
+        stratify=labels,
+    )
+    validation_paths, test_paths, validation_labels, test_labels = train_test_split(
+        temporary_paths,
+        temporary_labels,
+        test_size=validation_size,
+        random_state=42,
+        stratify=temporary_labels,
+    )
+    return (
+        train_paths,
+        validation_paths,
+        test_paths,
+        train_labels,
+        validation_labels,
+        test_labels,
     )
 
-    X_val, X_test = train_test_split(
-        X_temp, test_size=0.5, random_state=42
+
+def create_augmentation_preview(image_paths):
+    image_path = random.choice(image_paths)
+    image = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
+    blurred = cv2.GaussianBlur(image, (3, 3), 0)
+    noise = np.random.randint(-15, 16, image.shape)
+    noisy = np.clip(image.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    flipped = cv2.flip(image, 1)
+    return image, blurred, noisy, flipped
+
+
+def create_dataset(directory, shuffle=True, batch_size=32):
+    image_paths, _ = validate_image_dataset(directory)
+    labels = [
+        CLASS_NAMES.index(get_label_from_path(image_path))
+        for image_path in image_paths
+    ]
+    dataset = tf.data.Dataset.from_tensor_slices((image_paths, labels))
+
+    def load_image(image_path, label):
+        image = tf.io.read_file(image_path)
+        image = tf.image.decode_image(image, channels=3, expand_animations=False)
+        image.set_shape([None, None, 3])
+        image = tf.image.resize(image, IMAGE_SIZE)
+        return image, label
+
+    if shuffle:
+        dataset = dataset.shuffle(len(image_paths), seed=42)
+    return dataset.map(load_image).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+def create_model(num_classes=len(CLASS_NAMES)):
+    base_model = tf.keras.applications.InceptionV3(
+        weights="imagenet",
+        include_top=False,
+        input_shape=(*IMAGE_SIZE, 3),
     )
-    
-    y_train = [get_label_from_path(path, class_names) for path in X_train]
-    y_val = [get_label_from_path(path, class_names) for path in X_val]
-    y_test = [get_label_from_path(path, class_names) for path in X_test]
-
-    return X_train, X_val, X_test, y_train, y_val, y_test
-
-def augmentation(image):
-    image_path = random.choice(image)
-    img = cv2.imread(image_path)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    blurred_img = cv2.GaussianBlur(img, (3, 3), 0)
-    noise = np.random.randint(-15, 16, img.shape)
-    noise_img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-    flipped_img = cv2.flip(img, 1)
-    return blurred_img, noise_img, flipped_img
-
-def create_dataset_and_normalize(directory, shuffle=True):
-    dataset = tf.keras.utils.image_dataset_from_directory(
-        directory,
-        image_size=(224, 224),
-        batch_size=32,
-        shuffle=shuffle
-    )
-    
-    normalization = tf.keras.layers.Rescaling(1./255)
-
-    dataset = dataset.map(
-        lambda images, labels: (normalization(images), labels)
-    )
-
-    return dataset
-
-def create_model():
-    base_model = tf.keras.applications.InceptionV3(weights="imagenet",include_top=False, input_shape=(224,224,3))
     base_model.trainable = False
-    inputs = tf.keras.Input(shape=(224,224,3))
-    x = tf.keras.layers.Rescaling(1./127.5, offset=-1)(inputs)
+
+    inputs = tf.keras.Input(shape=(*IMAGE_SIZE, 3))
+    x = tf.keras.layers.Rescaling(1 / 127.5, offset=-1)(inputs)
     x = base_model(x, training=False)
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
     x = tf.keras.layers.Dense(128, activation="relu")(x)
-    outputs = tf.keras.layers.Dense(
-        4,
-        activation="softmax"
-    )(x)
-    model = tf.keras.Model(inputs, outputs)
-    return model
+    outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    return tf.keras.Model(inputs, outputs)
+
+
+def train_model(
+    train_dir=TRAIN_DIR,
+    validation_dir=VAL_DIR,
+    epochs=25,
+    learning_rate=0.001,
+    model_path=MODEL_PATH,
+):
+    train_dataset = create_dataset(train_dir, shuffle=True)
+    validation_dataset = create_dataset(validation_dir, shuffle=False)
+    model = create_model()
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=6,
+            restore_best_weights=True,
+        ),
+        tf.keras.callbacks.ModelCheckpoint(
+            model_path,
+            monitor="val_loss",
+            save_best_only=True,
+        ),
+    ]
+    history = model.fit(
+        train_dataset,
+        validation_data=validation_dataset,
+        epochs=epochs,
+        callbacks=callbacks,
+    )
+    return model, history, train_dataset, validation_dataset
+
+
+def evaluate_model(model, dataset):
+    y_true = np.concatenate([labels.numpy() for _, labels in dataset])
+    y_probability = model.predict(dataset, verbose=0)
+    y_pred = np.argmax(y_probability, axis=1)
+    report = classification_report(
+        y_true,
+        y_pred,
+        target_names=CLASS_NAMES,
+        output_dict=True,
+        zero_division=0,
+    )
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "report": report,
+        "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
+    }
+
+
+def fine_tune_model(model, train_dataset, validation_dataset, epochs=5):
+    base_model = next(
+        layer for layer in model.layers if isinstance(layer, tf.keras.Model)
+    )
+    base_model.trainable = True
+    for layer in base_model.layers[:-20]:
+        layer.trainable = False
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.00001),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    return model.fit(
+        train_dataset,
+        validation_data=validation_dataset,
+        epochs=epochs,
+    )
+
+
+def run_classification():
+    setup_gpu()
+    train_valid, train_invalid = validate_image_dataset(TRAIN_DIR)
+    val_valid, val_invalid = validate_image_dataset(VAL_DIR)
+    metrics = {
+        "train_valid_images": len(train_valid),
+        "train_invalid_images": len(train_invalid),
+        "validation_valid_images": len(val_valid),
+        "validation_invalid_images": len(val_invalid),
+    }
+    model, history, train_dataset, validation_dataset = train_model()
+    metrics["validation"] = evaluate_model(model, validation_dataset)
+    fine_tune_model(model, train_dataset, validation_dataset)
+    model.save("./models/brain_tumor_classification_finetuned.keras")
+    metrics["fine_tuned_validation"] = evaluate_model(model, validation_dataset)
+    return model, history, metrics
+
+
+if __name__ == "__main__":
+    run_classification()
