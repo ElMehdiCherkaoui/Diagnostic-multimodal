@@ -111,8 +111,7 @@ def create_augmentation_preview(image_paths):
     return image, blurred, noisy, flipped
 
 
-def create_dataset(directory, shuffle=True, batch_size=32):
-    image_paths, _ = validate_image_dataset(directory)
+def create_dataset_from_paths(image_paths, shuffle=True, batch_size=32):
     labels = [
         CLASS_NAMES.index(get_label_from_path(image_path))
         for image_path in image_paths
@@ -131,6 +130,11 @@ def create_dataset(directory, shuffle=True, batch_size=32):
     return dataset.map(load_image).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
+def create_dataset(directory, shuffle=True, batch_size=32):
+    image_paths, _ = validate_image_dataset(directory)
+    return create_dataset_from_paths(image_paths, shuffle, batch_size)
+
+
 def create_model(num_classes=len(CLASS_NAMES)):
     base_model = tf.keras.applications.InceptionV3(
         weights="imagenet",
@@ -140,10 +144,19 @@ def create_model(num_classes=len(CLASS_NAMES)):
     base_model.trainable = False
 
     inputs = tf.keras.Input(shape=(*IMAGE_SIZE, 3))
-    x = tf.keras.layers.Rescaling(1 / 127.5, offset=-1)(inputs)
+    augmentation = tf.keras.Sequential(
+        [
+            tf.keras.layers.RandomFlip("horizontal"),
+            tf.keras.layers.RandomRotation(0.05),
+            tf.keras.layers.GaussianNoise(0.05),
+        ]
+    )
+    x = augmentation(inputs)
+    x = tf.keras.layers.Rescaling(1 / 127.5, offset=-1)(x)
     x = base_model(x, training=False)
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
     x = tf.keras.layers.Dense(128, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
     outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
     return tf.keras.Model(inputs, outputs)
 
@@ -199,6 +212,11 @@ def evaluate_model(model, dataset):
     )
     return {
         "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(
+            report["weighted avg"]["precision"]
+        ),
+        "recall": float(report["weighted avg"]["recall"]),
+        "f1_score": float(report["weighted avg"]["f1-score"]),
         "report": report,
         "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
     }
@@ -226,19 +244,58 @@ def fine_tune_model(model, train_dataset, validation_dataset, epochs=5):
 
 def run_classification():
     setup_gpu()
-    train_valid, train_invalid = validate_image_dataset(TRAIN_DIR)
-    val_valid, val_invalid = validate_image_dataset(VAL_DIR)
+    train_images, train_invalid = validate_image_dataset(TRAIN_DIR)
+    val_images, val_invalid = validate_image_dataset(VAL_DIR)
+    all_images = train_images + val_images
+    (
+        train_paths,
+        validation_paths,
+        test_paths,
+        _,
+        _,
+        _,
+    ) = split_dataset(all_images)
+    train_dataset = create_dataset_from_paths(train_paths)
+    validation_dataset = create_dataset_from_paths(
+        validation_paths, shuffle=False
+    )
+    test_dataset = create_dataset_from_paths(test_paths, shuffle=False)
     metrics = {
-        "train_valid_images": len(train_valid),
+        "train_valid_images": len(train_images),
         "train_invalid_images": len(train_invalid),
-        "validation_valid_images": len(val_valid),
+        "validation_valid_images": len(val_images),
         "validation_invalid_images": len(val_invalid),
+        "split_counts": {
+            "train": len(train_paths),
+            "validation": len(validation_paths),
+            "test": len(test_paths),
+        },
     }
-    model, history, train_dataset, validation_dataset = train_model()
+    model = create_model()
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    history = model.fit(
+        train_dataset,
+        validation_data=validation_dataset,
+        epochs=25,
+        callbacks=[
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss", patience=6, restore_best_weights=True
+            ),
+            tf.keras.callbacks.ModelCheckpoint(
+                MODEL_PATH, monitor="val_loss", save_best_only=True
+            ),
+        ],
+    )
     metrics["validation"] = evaluate_model(model, validation_dataset)
+    metrics["test"] = evaluate_model(model, test_dataset)
     fine_tune_model(model, train_dataset, validation_dataset)
     model.save("./models/brain_tumor_classification_finetuned.keras")
     metrics["fine_tuned_validation"] = evaluate_model(model, validation_dataset)
+    metrics["fine_tuned_test"] = evaluate_model(model, test_dataset)
     return model, history, metrics
 
 
