@@ -1,0 +1,6 @@
+path: ./data/detection
+train: train/images
+val: valid/images
+test: test/images
+nc: 4
+names: [Glioma, Meningioma, No_Tumor, Pituitary]
