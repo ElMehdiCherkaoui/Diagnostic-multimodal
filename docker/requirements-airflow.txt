@@ -1,0 +1,6 @@
+tensorflow
+ultralytics
+scikit-learn
+pillow
+opencv-python-headless
+mlflow
